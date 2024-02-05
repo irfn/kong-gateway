@@ -1,0 +1,171 @@
+version: '2.2'
+x-kong-image:
+  &kong-image
+  image: kong/kong-gateway:3.5-debian
+
+x-kong-db-config:
+  &kong-db-config
+  KONG_DATABASE: postgres
+  KONG_PG_HOST: db
+  KONG_PG_DATABASE: kong
+  KONG_PG_USER: kong
+  KONG_PG_PASSWORD: kong
+  KONG_PASSWORD: password
+
+x-kong-container-common:
+  &kong-container-common
+  healthcheck:
+    test: [ "CMD", "kong", "health" ]
+    interval: 10s
+    timeout: 10s
+    retries: 10
+  restart: on-failure
+  tmpfs:
+    - /tmp
+
+x-kong-common-config:
+  &kong-common-config
+  KONG_ADMIN_LISTEN: "0.0.0.0:48001, 0.0.0.0:48444 http2 ssl reuseport backlog=65536"
+  KONG_STATUS_LISTEN: "0.0.0.0:48100 ssl"
+  KONG_ANONYMOUS_REPORTS: "off"
+  KONG_ADMIN_SSL_CERT_KEY: "/tmp/certs/local/kong/ssl.key"
+  KONG_ADMIN_SSL_CERT: "/tmp/certs/local/kong/ssl.cert"
+  KONG_LOG_LEVEL: "debug"
+  KONG_SSL_CERT_KEY: "/tmp/certs/local/kong/ssl.key"
+  KONG_SSL_CERT: "/tmp/certs/local/kong/ssl.cert"
+  KONG_CLUSTER_CERT: /tmp/certs/cluster/cluster.crt
+  KONG_CLUSTER_CERT_KEY: /tmp/certs/cluster/cluster.key
+  KONG_NGINX_WORKER_PROCESSES: 1
+  KONG_EVENT_HOOKS_ENABLED: "on"
+  KONG_TRUSTED_IPS: "0.0.0.0/0"
+  KONG_REAL_IP_HEADER: "X-Forwarded-For"
+#  KONG_REAL_IP_HEADER: "proxy-protocol"
+  KONG_REAL_IP_RECURSIVE: "on"
+  KONG_ROUTER_FLAVOR: "traditional"
+#  KONG_PLUGINS: "bundled"
+#  KONG_PLUGINS: "bundled, log-filter"
+#  KONG_PLUGINS: "bundled, custom-handler"
+#  KONG_PLUGINS: "bundled, openid-connect_1051"
+#  KONG_NGINX_PROXY_KEEPALIVE_REQUESTS: 0
+
+networks:
+  dev-kong-net:
+    name: dev-kong-net
+    driver: bridge
+
+services:
+    kong-migrations:
+      <<: *kong-image
+      networks:
+        - dev-kong-net
+      command: "kong migrations bootstrap"
+      environment:
+        <<: [ *kong-db-config ]
+      restart: on-failure
+
+    kong-migrations-upgrade:
+      <<: *kong-image
+      profiles: [ "upgrade", "everything" ]
+      networks:
+        - dev-kong-net
+      command: "kong migrations up"
+      environment:
+        <<: [ *kong-db-config ]
+      restart: on-failure
+
+    kong-migrations-finish:
+      <<: *kong-image
+      profiles: [ "upgrade-finish", "everything" ]
+      networks:
+        - dev-kong-net
+      command: "kong migrations finish"
+      environment:
+        <<: [ *kong-db-config ]
+      restart: on-failure
+
+    kong-cp:
+      <<: [ *kong-image, *kong-container-common, *kong-common-config ]
+      deploy:
+        replicas: 1
+      mem_limit: 1g
+      cpus: 1
+      networks:
+        - dev-kong-net
+      user: "${KONG_USER:-kong}"
+      depends_on:
+        db:
+          condition: service_healthy
+      volumes:
+        - ./certs:/tmp/certs
+        - ./http_content:/tmp/htdocs
+        - ./config:/tmp/kong_config
+      environment:
+        <<: [ *kong-db-config, *kong-common-config ]
+        KONG_PROXY_LISTEN: "off"
+        KONG_ROLE: control_plane
+        KONG_CLUSTER_CERT: /tmp/certs/cluster/cluster.crt
+        KONG_CLUSTER_CERT_KEY: /tmp/certs/cluster/cluster.key
+        KONG_CLUSTER_DATA_PLANE_PURGE_DELAY: 60
+        KONG_CLUSTER_LISTEN: "0.0.0.0:48005"
+        KONG_CLUSTER_TELEMETRY_LISTEN: "0.0.0.0:48006"
+        KONG_PORTAL_API_LISTEN: "0.0.0.0:48004, 0.0.0.0:48447 http2 ssl"
+        KONG_PG_MAX_CONCURRENT_QUERIES: 5
+        KONG_ADMIN_ACCESS_LOG: /dev/stdout
+        KONG_ADMIN_ERROR_LOG: /dev/stderr
+        KONG_STATUS_ACCESS_LOG: /dev/stdout
+        KONG_STATUS_ERROR_LOG: /dev/stderr
+        KONG_STATUS_SSL_CERT_KEY: "/tmp/certs/local/kong/ssl.key"
+        KONG_STATUS_SSL_CERT: "/tmp/certs/local/kong/ssl.cert"
+        KONG_ADMIN_API_URI: "https://api.kong.local"
+        KONG_TRACING: "off"
+        KONG_TRACING_DEBUG_HEADER: "X-Kong-Debug"
+        KONG_GENERATE_TRACE_DETAILS: "off"
+        KONG_NGINX_HTTP_INCLUDE: "/tmp/htdocs/http_server.conf"
+
+    kong-dp:
+        <<: [ *kong-image, *kong-container-common ]
+        mem_limit: 1g
+        deploy:
+          replicas: 1
+        networks:
+          - dev-kong-net
+        # add this capability if you want to install and run iptables rules on the DP
+        cap_add:
+          - NET_ADMIN
+        depends_on:
+          kong-cp:
+            condition: service_healthy
+        volumes:
+          - ./certs:/tmp/certs
+          - ./http_content:/tmp/htdocs
+          - ./config:/tmp/kong_config
+        environment:
+          <<: [ *kong-container-common, *kong-common-config ]
+          KONG_PROXY_LISTEN: "0.0.0.0:48000, 0.0.0.0:48443 http2 ssl reuseport backlog=65536, 0.0.0.0:48800 proxy_protocol, 0.0.0.0:48843 http2 ssl reuseport backlog=65536 proxy_protocol"
+          KONG_STREAM_LISTEN: "0.0.0.0:45555, 0.0.0.0:45556 ssl reuseport backlog=65536"
+          # KONG_PROXY_ACCESS_LOG: /dev/stdout show_correlation_id
+          KONG_PROXY_ACCESS_LOG: /dev/stdout
+          KONG_PROXY_ERROR_LOG: /dev/stderr
+          KONG_DATABASE: "off"
+          KONG_ROLE: data_plane
+          KONG_CLUSTER_CONTROL_PLANE: kong-cp:48005
+          KONG_CLUSTER_TELEMETRY_ENDPOINT: kong-cp:48006
+          KONG_DATA_PLANE_CONFIG_CACHE_PATH: "/tmp/kong_config/config.cache.json.gz"
+        ports:
+          - "18443:48443/tcp"
+    db:
+      networks:
+        - dev-kong-net
+      image: postgres:14-alpine
+      environment:
+        POSTGRES_DB: kong
+        POSTGRES_PASSWORD: kong
+        POSTGRES_USER: kong
+      healthcheck:
+        test: [ "CMD", "pg_isready", "-U", "kong" ]
+        interval: 30s
+        timeout: 30s
+        retries: 3
+      restart: on-failure
+      stdin_open: true
+      tty: true
